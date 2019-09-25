@@ -178,7 +178,27 @@ protected ResourcePatternResolver getResourcePatternResolver() {
 
 PathMatchingResourcePatternResolver支持Ant风格的路径解析。
 
+    classpath: 用于加载类路径（包括jar包）中的一个且仅一个资源
+    classpath*: 用于加载类路径（包括jar包）中的所有匹配的资源
+
+```java
+ResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
+Resource[] resources = null;
+
+//加载一个资源
+  resources = resolver.getResources("classpath:META-INF/spring.factories");
+  resources = resolver.getResources("META-INF/spring.factories");
+  resources = resolver.getResources("http://www.baidu.com");
+
+//加载多个资源
+  resources = resolver.getResources("classpath*:META-INF/spring.factories");
+  resources = resolver.getResources("classpath*:META-INF/*.factories");
+  resources = resolver.getResources("file:d:/*.txt");
+  resources = resolver.getResources("classpath*:com/seasy/**/*.class");  
+```
+
 ### 设置配置文件路径
+构造方法当中的第二行 `this.setConfigLocations(configLocations);`
 
 即AbstractRefreshableConfigApplicationContext.setConfigLocations:
 
@@ -207,8 +227,14 @@ protected String resolvePath(String path) {
 此方法的目的在于将占位符(placeholder)解析成实际的地址。比如可以这么写: `new ClassPathXmlApplicationContext("classpath:config.xml");`那么classpath:就是需要被解析的。
 
 getEnvironment方法来自于ConfigurableApplicationContext接口，源码很简单，如果为空就调用createEnvironment创建一个。AbstractApplicationContext.createEnvironment:
-
 ```java
+public ConfigurableEnvironment getEnvironment() {
+    if (this.environment == null) {
+        this.environment = this.createEnvironment();
+    }
+    return this.environment;
+}
+
 protected ConfigurableEnvironment createEnvironment() {
     return new StandardEnvironment();
 }
@@ -225,6 +251,10 @@ Environmen接口**代表了当前应用所处的环境。**从此接口的方法
 ##### Profile
 
 Spring Profile特性是从3.1开始的，其主要是为了解决这样一种问题: 线上环境和测试环境使用不同的配置或是数据库或是其它。有了Profile便可以在 不同环境之间无缝切换。**Spring容器管理的所有bean都是和一个profile绑定在一起的。**使用了Profile的配置文件示例:
+
+默认加载的profile名称为：default
+
+在SpringBoot当中可以使用`Spring.profile.active`指定加载的profile的名称
 
 ```xml
 <beans profile="develop">  
@@ -295,7 +325,7 @@ PropertySource接口代表了键值对的Property来源。继承体系：
 
 ![PropertySource继承体系](images/PropertySource.jpg)
 
-AbstractEnvironment.getSystemProperties:
+AbstractEnvironment当中的getSystemProperties和getSystemEnvironment方法:
 
 ```java
 @Override
@@ -322,11 +352,37 @@ public Map<String, Object> getSystemProperties() {
         };
     }
 }
+
+public Map<String, Object> getSystemEnvironment() {
+        if (this.suppressGetenvAccess()) {
+            return Collections.emptyMap();
+        } else {
+            try {
+                return System.getenv();
+            } catch (AccessControlException var2) {
+                return new ReadOnlySystemAttributesMap() {
+                    protected String getSystemAttribute(String attributeName) {
+                        try {
+                            return System.getenv(attributeName);
+                        } catch (AccessControlException var3) {
+                            if (AbstractEnvironment.this.logger.isInfoEnabled()) {
+                                AbstractEnvironment.this.logger.info("Caught AccessControlException when accessing system environment variable '" + attributeName + "'; its value will be returned [null]. Reason: " + var3.getMessage());
+                            }
+
+                            return null;
+                        }
+                    }
+                };
+            }
+        }
+    }
 ```
 
 这里的实现很有意思，如果安全管理器阻止获取全部的系统属性，那么会尝试获取单个属性的可能性，如果还不行就抛异常了。
 
 getSystemEnvironment方法也是一个套路，不过最终调用的是System.getenv，可以获取jvm和OS的一些版本信息。
+
+StandardEnvironment对象创建成功后，我们就可以接着查看 `getEnvironment().resolveRequiredPlaceholders(path)`对于路径信息解析处理
 
 #### 路径Placeholder处理
 
@@ -343,6 +399,7 @@ public String resolveRequiredPlaceholders(String text) throws IllegalArgumentExc
 propertyResolver是一个PropertySourcesPropertyResolver对象:
 
 ```java
+ this.propertySources = new MutablePropertySources(this.logger);
 private final ConfigurablePropertyResolver propertyResolver =
             new PropertySourcesPropertyResolver(this.propertySources);
 ```
@@ -391,6 +448,72 @@ private String doResolvePlaceholders(String text, PropertyPlaceholderHelper help
 }
 ```
 
+getPropertyAsRawString的具体实现在PropertySourcesPropertyResolver类中：
+```java
+protected String getPropertyAsRawString(String key) {
+    return (String)this.getProperty(key, String.class, false);
+}
+```
+继续跟踪helper.replacePlaceholders()，到了PropertyPlaceholderHelper.parseStringValue方法，这里面逐一找出每个占位符去做替换：
+```java
+public String replacePlaceholders(String value, PropertyPlaceholderHelper.PlaceholderResolver placeholderResolver) {
+    Assert.notNull(value, "'value' must not be null");
+    return this.parseStringValue(value, placeholderResolver, new HashSet());
+}
+
+protected String parseStringValue(String value, PropertyPlaceholderHelper.PlaceholderResolver placeholderResolver, Set<String> visitedPlaceholders) {
+    StringBuilder result = new StringBuilder(value);
+    int startIndex = value.indexOf(this.placeholderPrefix);
+
+    while(startIndex != -1) {
+        int endIndex = this.findPlaceholderEndIndex(result, startIndex);
+        if (endIndex != -1) {
+            String placeholder = result.substring(startIndex + this.placeholderPrefix.length(), endIndex);
+            String originalPlaceholder = placeholder;
+            if (!visitedPlaceholders.add(placeholder)) {
+                throw new IllegalArgumentException("Circular placeholder reference '" + placeholder + "' in property definitions");
+            }
+
+            placeholder = this.parseStringValue(placeholder, placeholderResolver, visitedPlaceholders);
+            String propVal = placeholderResolver.resolvePlaceholder(placeholder);
+            if (propVal == null && this.valueSeparator != null) {
+                int separatorIndex = placeholder.indexOf(this.valueSeparator);
+                if (separatorIndex != -1) {
+                    String actualPlaceholder = placeholder.substring(0, separatorIndex);
+                    String defaultValue = placeholder.substring(separatorIndex + this.valueSeparator.length());
+                    propVal = placeholderResolver.resolvePlaceholder(actualPlaceholder);
+                    if (propVal == null) {
+                        propVal = defaultValue;
+                    }
+                }
+            }
+
+            if (propVal != null) {
+                propVal = this.parseStringValue(propVal, placeholderResolver, visitedPlaceholders);
+                result.replace(startIndex, endIndex + this.placeholderSuffix.length(), propVal);
+                if (logger.isTraceEnabled()) {
+                    logger.trace("Resolved placeholder '" + placeholder + "'");
+                }
+
+                startIndex = result.indexOf(this.placeholderPrefix, startIndex + propVal.length());
+            } else {
+                if (!this.ignoreUnresolvablePlaceholders) {
+                    throw new IllegalArgumentException("Could not resolve placeholder '" + placeholder + "' in value \"" + value + "\"");
+                }
+
+                startIndex = result.indexOf(this.placeholderPrefix, endIndex + this.placeholderSuffix.length());
+            }
+
+            visitedPlaceholders.remove(originalPlaceholder);
+        } else {
+            startIndex = -1;
+        }
+    }
+
+    return result.toString();
+}
+```
+
 其实代码执行到这里的时候还没有进行xml配置文件的解析，那么这里的解析placeHolder是什么意思呢，原因在于可以这么写:
 
 ```java
@@ -430,43 +553,43 @@ AbstractApplicationContext.refresh:
 ```java
 @Override
 public void refresh() throws BeansException, IllegalStateException {
+//startupShutdownMonitor对象在spring环境刷新和销毁的时候都会用到，确保刷新和销毁不会同时执行
     synchronized (this.startupShutdownMonitor) {
-        // Prepare this context for refreshing.
+        // 准备工作，例如记录事件，设置标志，检查环境变量等，并有留给子类扩展的位置，用来将属性加入到applicationContext中
         prepareRefresh();
-        // Tell the subclass to refresh the internal bean factory.
+         // 创建beanFactory，这个对象作为applicationContext的成员变量，可以被applicationContext拿来用,
+        // 并且解析资源（例如xml文件），取得bean的定义，放在beanFactory中
         ConfigurableListableBeanFactory beanFactory = obtainFreshBeanFactory();
-        // Prepare the bean factory for use in this context.
+        // // 对beanFactory做一些设置，例如类加载器、spel解析器、指定bean的某些类型的成员变量对应某些对象等
         prepareBeanFactory(beanFactory);
         try {
-            // Allows post-processing of the bean factory in context subclasses.
+            // 子类扩展用，可以设置bean的后置处理器（bean在实例化之后这些后置处理器会执行）
             postProcessBeanFactory(beanFactory);
-            // Invoke factory processors registered as beans in the context.
+            // 执行beanFactory后置处理器（有别于bean后置处理器处理bean实例，beanFactory后置处理器处理bean定义）
             invokeBeanFactoryPostProcessors(beanFactory);
-            // Register bean processors that intercept bean creation.
+            // 将所有的bean的后置处理器排好序，但不会马上用，bean实例化之后会用到
             registerBeanPostProcessors(beanFactory);
-            // Initialize message source for this context.
+            // 初始化国际化服务
             initMessageSource();
-            // Initialize event multicaster for this context.
+            // 创建事件广播器
             initApplicationEventMulticaster();
-            // Initialize other special beans in specific context subclasses.
+            // 空方法，留给子类自己实现的，在实例化bean之前做一些ApplicationContext相关的操作
             onRefresh();
-            // Check for listener beans and register them.
+            // 注册一部分特殊的事件监听器，剩下的只是准备好名字，留待bean实例化完成后再注册
             registerListeners();
-            // Instantiate all remaining (non-lazy-init) singletons.
+            // 单例模式的bean的实例化、成员变量注入、初始化等工作都在此完成
             finishBeanFactoryInitialization(beanFactory);
-            // Last step: publish corresponding event.
+            // applicationContext刷新完成后的处理，例如生命周期监听器的回调，广播通知等
             finishRefresh();
-        } catch (BeansException ex) {
-            // Destroy already created singletons to avoid dangling resources.
+        }
+        catch (BeansException ex) {
+            logger.warn("Exception encountered during context initialization - cancelling refresh attempt", ex);
+            // 刷新失败后的处理，主要是将一些保存环境信息的集合做清理
             destroyBeans();
-            // Reset 'active' flag.
+            // applicationContext是否已经激活的标志，设置为false
             cancelRefresh(ex);
             // Propagate exception to caller.
             throw ex;
-        } finally {
-            // Reset common introspection caches in Spring's core, since we
-            // might not ever need metadata for singleton beans anymore...
-            resetCommonCaches();
         }
     }
 }
@@ -476,8 +599,11 @@ public void refresh() throws BeansException, IllegalStateException {
 
 ```java
 protected void prepareRefresh() {
+    // 记录初始化的时间
     this.startupDate = System.currentTimeMillis();
+    // context是否关闭的标识，设置为false
     this.closed.set(false);
+    // context是否激活的标识，设置为true
     this.active.set(true);
     // Initialize any placeholder property sources in the context environment
     //空实现
@@ -487,6 +613,11 @@ protected void prepareRefresh() {
     getEnvironment().validateRequiredProperties();
     // Allow for the collection of early ApplicationEvents,
     // to be published once the multicaster is available...
+   /**
+    AbstractPropertyResolver类的requiredProperties是个集合，
+    在下面的validateRequiredProperties方法中，都要拿requiredProperties中的元素作为key去检查是否存在对应的环境变量，
+    如果不存在就抛出异常
+    */
     this.earlyApplicationEvents = new LinkedHashSet<ApplicationEvent>();
 }
 ```
@@ -588,6 +719,8 @@ protected void loadBeanDefinitions(DefaultListableBeanFactory beanFactory) {
     loadBeanDefinitions(beanDefinitionReader);
 }
 ```
+
+![BeanDefinition加载过程](images/BeanDefinition加载过程.png)
 
 ##### EntityResolver
 
